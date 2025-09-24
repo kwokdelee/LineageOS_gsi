@@ -1,0 +1,148 @@
+name: Build LineageOS GSI
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Choose build variant"
+        type: choice
+        required: true
+        options:
+          - bvN (vanilla)
+          - bgN (with Google services)
+      jobs:
+        description: "make -j jobs (default: auto nproc)"
+        type: number
+        required: false
+  schedule:
+    - cron: "0 3 * * 1" # optional weekly build
+
+env:
+  USE_CCACHE: "1"
+  CCACHE_COMPRESS: "1"
+  CCACHE_MAXSIZE: "50G"
+  REPO_BRANCH: "lineage-22.2"
+  TREBLE_BRANCH: "15-los-qpr2"
+  LUNCH_PREFIX: "treble_arm64_"
+  PRODUCT: "tdgsi_arm64_ab"
+
+jobs:
+  build:
+    # Strongly recommended: self-hosted runner with plenty of RAM/CPU/disk
+    # runs-on: [self-hosted, linux]
+    runs-on: ubuntu-22.04
+
+    defaults:
+      run:
+        shell: bash -e -o pipefail {0}
+
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            openjdk-17-jdk git git-lfs curl python3 rsync bc bison gperf \
+            build-essential zip unzip libncurses5 libncurses5-dev \
+            zlib1g-dev libssl-dev flex ccache \
+            pkg-config libxml2-utils xsltproc lzop \
+            jq aria2 p7zip-full
+          git lfs install
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-${{ github.workflow }}-${{ github.ref }}-${{ inputs.variant || 'bvN' }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ github.workflow }}-
+
+      - name: Prepare workspace
+        run: |
+          mkdir -p LineageOS
+          cd LineageOS
+          echo "repo init..."
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ./repo
+          chmod +x ./repo
+          ./repo init -u https://github.com/LineageOS/android.git -b "${REPO_BRANCH}" --git-lfs
+          echo "Add treble manifest..."
+          git clone https://github.com/MisterZtr/treble_manifest.git .repo/local_manifests -b "${TREBLE_BRANCH}"
+
+      - name: Sync source
+        working-directory: LineageOS
+        run: |
+          ./repo sync --force-sync --optimized-fetch --no-tags --no-clone-bundle --prune -j4
+
+      - name: Apply patches
+        working-directory: LineageOS
+        run: |
+          if [ ! -d ../patches ]; then
+            echo "Missing patches/ in repo root" >&2
+            exit 1
+          fi
+          rsync -a ../patches ./patches
+          bash patches/apply-patches.sh .
+
+      - name: Generate treble makefiles
+        working-directory: LineageOS
+        run: |
+          cd device/phh/treble
+          bash generate.sh lineage
+          # Copy variant makefiles from workflow repo
+          cp -v ../../../device/phh/treble/treble_arm64_bgN.mk ./
+          cp -v ../../../device/phh/treble/treble_arm64_bvN.mk ./
+
+      - name: Configure ccache
+        run: |
+          echo "export USE_CCACHE=${USE_CCACHE}" >> $GITHUB_ENV
+          echo "export CCACHE_COMPRESS=${CCACHE_COMPRESS}" >> $GITHUB_ENV
+          echo "export CCACHE_DIR=${HOME}/.ccache" >> $GITHUB_ENV
+          ccache -M ${CCACHE_MAXSIZE} -F 0
+          ccache -s
+
+      - name: Build system image
+        working-directory: LineageOS
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+        run: |
+          source build/envsetup.sh
+          VARIANT_INPUT="${{ inputs.variant }}"
+          if [[ "$VARIANT_INPUT" == "bgN (with Google services)" ]]; then
+            VAR="bgN"
+          else
+            VAR="bvN"
+          fi
+          lunch "${LUNCH_PREFIX}${VAR}-bp1a-userdebug"
+          JOBS="${{ inputs.jobs }}"
+          if [[ -z "$JOBS" || "$JOBS" -le 0 ]]; then
+            JOBS="$(nproc --all)"
+          fi
+          echo "Building with -j${JOBS} for ${VAR}..."
+          make systemimage -j"${JOBS}"
+
+      - name: Compress system image
+        working-directory: LineageOS
+        run: |
+          OUT="out/target/product/${PRODUCT}"
+          IMG="${OUT}/system.img"
+          if [[ ! -f "${IMG}" ]]; then
+            echo "system.img not found at ${IMG}" >&2
+            exit 1
+          fi
+          7zz a "${OUT}/system.img.xz" "${IMG}"
+          ls -lh "${OUT}/system.img" "${OUT}/system.img.xz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: system-${{ inputs.variant || 'bvN' }}-img-xz
+          path: LineageOS/out/target/product/tdgsi_arm64_ab/system.img.xz
+          if-no-files-found: error
+
+      - name: Show ccache stats
+        run: ccache -s
